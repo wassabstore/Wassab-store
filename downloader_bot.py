@@ -369,7 +369,7 @@ async def handle_admin_messages(update: Update, context: ContextTypes.DEFAULT_TY
     await handle_url_input(update, context)
 
 if __name__ == '__main__':
-    BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # <--- ضع توكن البوت الخاص بك هنا
+    BOT_TOKEN = "9011485348:AAGo-8Z2VaJNn3xo4Aufip16V87sP_n5E9Y"  # <--- ضع توكن البوت الخاص بك هنا
     
     application = (
         ApplicationBuilder()
