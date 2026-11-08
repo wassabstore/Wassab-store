@@ -1,12 +1,13 @@
 import logging
 import os
+import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 import yt_dlp
 
-# إعداد خادم وهمي بسيط لإبقاء البورت مفتوحاً على Render ومنع الانقطاع
+# إعداد خادم وهمي بسيط لإبقاء البورت مفتوحاً على Render
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -18,10 +19,8 @@ def run_web_server():
     server = HTTPServer(('0.0.0.0', port), SimpleHandler)
     server.serve_forever()
 
-# تشغيل السيرفر الوهمي في الخلفية
 threading.Thread(target=run_web_server, daemon=True).start()
 
-# تفعيل تسجيل الأخطاء
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -34,7 +33,28 @@ OWNER_USERNAME = "wassabstore"
 CHANNEL_USERNAME = "@wassab_store"  
 CHANNEL_LINK = "https://t.me/wassab_store"
 
-USERS_DB = {}
+# ملف لحفظ المستخدمين بشكل دائم لكي لا يتم حذفهم عند انطفاء السيرفر
+USERS_FILE = "users_db.json"
+
+def load_users():
+    if os.path.exists(USERS_FILE):
+        try:
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                # تحويل مفاتيح الـ JSON إلى أرقام صحيحة (Integers)
+                data = json.load(f)
+                return {int(k): v for k, v in data.items()}
+        except Exception:
+            return {}
+    return {}
+
+def save_users(db):
+    try:
+        with open(USERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        logging.error(f"Error saving users: {e}")
+
+USERS_DB = load_users()
 
 async def check_subscription(user_id, context):
     try:
@@ -49,7 +69,12 @@ def register_user(user):
     user_id = user.id
     user_fullname = f"{user.first_name} {user.last_name or ''}".strip()
     username = f"@{user.username}" if user.username else "بدون يوزر"
-    USERS_DB[user_id] = {"name": user_fullname, "username": username}
+    
+    USERS_DB[user_id] = {
+        "name": user_fullname,
+        "username": username
+    }
+    save_users(USERS_DB) # حفظ دائم في الملف
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -264,6 +289,9 @@ async def admin_panel(query, context):
         await query.answer("هذه اللوحة خاصة بالمالك فقط!", show_alert=True)
         return
 
+    global USERS_DB
+    USERS_DB = load_users() # تحديث البيانات من الملف عند فتح اللوحة
+
     keyboard = [
         [InlineKeyboardButton("👥 عرض قائمة المستخدمين", callback_data="list_all_users")],
         [InlineKeyboardButton("📢 إرسال إذاعة (Broadcast)", callback_data="broadcast_prompt")],
@@ -274,13 +302,17 @@ async def admin_panel(query, context):
 async def list_all_users(query, context):
     if query.from_user.id != SUPER_ADMIN_ID:
         return
+
+    global USERS_DB
+    USERS_DB = load_users()
+
     if not USERS_DB:
         await query.edit_message_text("📭 لا يوجد مستخدمين مسجلين حتى الآن.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")]]))
         return
 
     users_text = f"👥 **قائمة المستخدمين ({len(USERS_DB)}):**\n\n"
     for uid, data in USERS_DB.items():
-        users_text += f"👤 {data['name']} | `{uid}` | {data['username']}\n"
+        users_text += f"👤 {data['name']}\n🆔 `{uid}`\n🔗 {data['username']}\n-------------------\n"
 
     if len(users_text) > 4000:
         users_text = users_text[:4000]
@@ -303,6 +335,9 @@ async def handle_admin_messages(update: Update, context: ContextTypes.DEFAULT_TY
         success_count, fail_count = 0, 0
         await update.message.reply_text("🚀 جاري إرسال الإذاعة...")
         
+        global USERS_DB
+        USERS_DB = load_users()
+
         for target_id in USERS_DB.keys():
             try:
                 await context.bot.copy_message(chat_id=target_id, from_chat_id=update.message.chat_id, message_id=update.message.message_id)
@@ -316,7 +351,7 @@ async def handle_admin_messages(update: Update, context: ContextTypes.DEFAULT_TY
     await handle_url_input(update, context)
 
 if __name__ == '__main__':
-    BOT_TOKEN = "9011485348:AAGo-8Z2VaJNn3xo4Aufip16V87sP_n5E9Y"  # التوكن الصحيح الخاص بك
+    BOT_TOKEN = "9011485348:AAGo-8Z2VaJNn3xo4Aufip16V87sP_n5E9Y"
     
     application = ApplicationBuilder().token(BOT_TOKEN).read_timeout(60).write_timeout(60).connect_timeout(60).build()
 
@@ -324,5 +359,5 @@ if __name__ == '__main__':
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), handle_admin_messages))
 
-    print("🚀 البوت يعمل الآن مع سيرفر الويب والبورت المخصص للسحابة...")
+    print("🚀 البوت يعمل الآن مع نظام تخزين المستخدمين الدائم...")
     application.run_polling()
