@@ -1,10 +1,27 @@
 import logging
 import os
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 import yt_dlp
 
-# تفعيل تسجيل الأخطاء السريع
+# إعداد خادم وهمي بسيط لإبقاء البورت مفتوحاً على Render ومنع الانقطاع
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Wassab Store Bot is running 24/7!")
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), SimpleHandler)
+    server.serve_forever()
+
+# تشغيل السيرفر الوهمي في الخلفية
+threading.Thread(target=run_web_server, daemon=True).start()
+
+# تفعيل تسجيل الأخطاء
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -14,14 +31,11 @@ logging.basicConfig(
 SUPER_ADMIN_ID = 8233150959  
 OWNER_USERNAME = "wassabstore"
 
-# بيانات قناتك الخاصة بالاشتراك الإجباري
 CHANNEL_USERNAME = "@wassab_store"  
 CHANNEL_LINK = "https://t.me/wassab_store"
 
-# قاعدة بيانات لتخزين بيانات المستخدمين
 USERS_DB = {}
 
-# دالة للتحقق مما إذا كان المستخدم مشتركاً في القناة الإجبارية
 async def check_subscription(user_id, context):
     try:
         member = await context.bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
@@ -31,22 +45,15 @@ async def check_subscription(user_id, context):
         logging.error(f"Subscription check error: {e}")
     return False
 
-# تسجيل المستخدم في قاعدة البيانات
 def register_user(user):
     user_id = user.id
     user_fullname = f"{user.first_name} {user.last_name or ''}".strip()
     username = f"@{user.username}" if user.username else "بدون يوزر"
-    
-    USERS_DB[user_id] = {
-        "name": user_fullname,
-        "username": username
-    }
+    USERS_DB[user_id] = {"name": user_fullname, "username": username}
 
-# دالة البداية /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
-    
     register_user(user)
     
     is_subscribed = await check_subscription(user_id, context)
@@ -57,7 +64,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         await update.message.reply_text(
             f"⚠️ عذراً يا {user.first_name}!\n\n"
-            f"يجب عليك الاشتراك في قناتنا أولاً (`{CHANNEL_USERNAME}`) لكي تتمكن من استخدام البوت وتحميل الفيديوهات.",
+            f"يجب عليك الاشتراك في قناتنا أولاً (`{CHANNEL_USERNAME}`) لكي تتمكن من استخدام البوت.",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
@@ -67,7 +74,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💬 تواصل مع المالك", url=f"https://t.me/{OWNER_USERNAME}")],
         [InlineKeyboardButton("ℹ️ حول البوت", callback_data="about_bot")]
     ]
-    
     if user_id == SUPER_ADMIN_ID:
         keyboard.append([InlineKeyboardButton("⚙️ لوحة التحكم للإدارة", callback_data="admin_panel")])
 
@@ -78,7 +84,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# استقبال الرابط وعرض الواجهة بالشكل المطلوب
 async def handle_url_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
@@ -97,14 +102,12 @@ async def handle_url_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
-    
     if not text.startswith("http://") and not text.startswith("https://"):
         await update.message.reply_text("⚠️ يرجى إرسال رابط صالح يبدأ بـ http أو https")
         return
 
     context.user_data['pending_url'] = text
 
-    # واجهة الأزرار بالتصميم المطلوب
     keyboard = [
         [InlineKeyboardButton("🎞️ ¦ مقطع فيديو.", callback_data="choice_video")],
         [
@@ -120,12 +123,10 @@ async def handle_url_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# معالجة اختيارات الأزرار
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    
     data = query.data
 
     if data == "check_sub":
@@ -187,14 +188,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
-# تنفيذ التحميل مع رسالة "♻️┇جاري التحميل..."
 async def process_download(query, context, media_type, quality=None):
     url = context.user_data.get('pending_url')
     if not url:
         await query.edit_message_text("⚠️ انتهت صلاحية الرابط أو حدث خطأ. أرسل الرابط من جديد.")
         return
 
-    # الرسالة المطلوبة تماماً
     await query.edit_message_text("♻️┇جاري التحميل...")
 
     if media_type in ["audio", "voice"]:
@@ -225,7 +224,6 @@ async def process_download(query, context, media_type, quality=None):
     file_path = None
     try:
         os.makedirs("downloads", exist_ok=True)
-        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if not info:
@@ -240,27 +238,15 @@ async def process_download(query, context, media_type, quality=None):
         if media_type == "audio":
             await context.bot.send_chat_action(chat_id=chat_id, action="upload_audio")
             with open(file_path, 'rb') as audio_file:
-                await context.bot.send_audio(
-                    chat_id=chat_id,
-                    audio=audio_file,
-                    caption="🎵 تم إرسال الملف الصوتي بنجاح عبر @wassabstore."
-                )
+                await context.bot.send_audio(chat_id=chat_id, audio=audio_file, caption="🎵 تم إرسال الملف الصوتي بنجاح عبر @wassabstore.")
         elif media_type == "voice":
             await context.bot.send_chat_action(chat_id=chat_id, action="upload_voice")
             with open(file_path, 'rb') as voice_file:
-                await context.bot.send_voice(
-                    chat_id=chat_id,
-                    voice=voice_file,
-                    caption="🎙️ تم إرسال البصمة الصوتية بنجاح عبر @wassabstore."
-                )
+                await context.bot.send_voice(chat_id=chat_id, voice=voice_file, caption="🎙️ تم إرسال البصمة الصوتية بنجاح عبر @wassabstore.")
         else:
             await context.bot.send_chat_action(chat_id=chat_id, action="upload_video")
             with open(file_path, 'rb') as video_file:
-                await context.bot.send_video(
-                    chat_id=chat_id,
-                    video=video_file,
-                    caption=f"⚡ تم التحميل بنجاح (جودة {quality}p) عبر @wassabstore."
-                )
+                await context.bot.send_video(chat_id=chat_id, video=video_file, caption=f"⚡ تم التحميل بنجاح (جودة {quality}p) عبر @wassabstore.")
 
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
@@ -271,118 +257,72 @@ async def process_download(query, context, media_type, quality=None):
         logging.error(f"Error: {e}")
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
-            
-        await query.edit_message_text(
-            "❌ عذراً، تعذر تحميل هذا الملف. قد يكون الرابط محمياً أو غير مدعوم."
-        )
+        await query.edit_message_text("❌ عذراً، تعذر تحميل هذا الملف. قد يكون الرابط محمياً أو غير مدعوم.")
 
-# لوحة تحكم المالك
 async def admin_panel(query, context):
     if query.from_user.id != SUPER_ADMIN_ID:
         await query.answer("هذه اللوحة خاصة بالمالك فقط!", show_alert=True)
         return
 
     keyboard = [
-        [InlineKeyboardButton("👥 عرض قائمة المستخدمين (IDs & Usernames)", callback_data="list_all_users")],
-        [InlineKeyboardButton("📢 إرسال رسالة لجميع المشتركين (Broadcast)", callback_data="broadcast_prompt")],
+        [InlineKeyboardButton("👥 عرض قائمة المستخدمين", callback_data="list_all_users")],
+        [InlineKeyboardButton("📢 إرسال إذاعة (Broadcast)", callback_data="broadcast_prompt")],
         [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="back_home")]
     ]
-    
-    await query.edit_message_text(
-        f"⚙️ **لوحة تحكم المالك:**\n\n"
-        f"👥 إجمالي عدد المستخدمين المسجلين: `{len(USERS_DB)}`",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
+    await query.edit_message_text(f"⚙️ **لوحة تحكم المالك:**\n\n👥 إجمالي عدد المستخدمين: `{len(USERS_DB)}`", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-# عرض قائمة المستخدمين مع الـ ID والـ Username
 async def list_all_users(query, context):
     if query.from_user.id != SUPER_ADMIN_ID:
         return
-
     if not USERS_DB:
-        await query.edit_message_text(
-            "📭 لا يوجد مستخدمين مسجلين حتى الآن.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع لوحة التحكم", callback_data="admin_panel")]])
-        )
+        await query.edit_message_text("📭 لا يوجد مستخدمين مسجلين حتى الآن.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")]]))
         return
 
-    users_text = f"👥 **قائمة المستخدمين ({len(USERS_DB)} مستخدم):**\n\n"
+    users_text = f"👥 **قائمة المستخدمين ({len(USERS_DB)}):**\n\n"
     for uid, data in USERS_DB.items():
-        users_text += f"👤 الاسم: {data['name']}\n🆔 الـ ID: `{uid}`\n🔗 اليوزر: {data['username']}\n-------------------\n"
+        users_text += f"👤 {data['name']} | `{uid}` | {data['username']}\n"
 
     if len(users_text) > 4000:
-        users_text = users_text[:4000] + "\n... (النص طويل جداً، تم اختصاره)"
+        users_text = users_text[:4000]
 
-    await query.edit_message_text(
-        users_text,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع لوحة التحكم", callback_data="admin_panel")]]),
-        parse_mode="Markdown"
-    )
+    await query.edit_message_text(users_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")]]), parse_mode="Markdown")
 
-# طلب رسالة الإذاعة
 async def broadcast_prompt(query, context):
     if query.from_user.id != SUPER_ADMIN_ID:
         return
-
     context.user_data['waiting_for_broadcast'] = True
-    await query.edit_message_text(
-        "📢 **إرسال رسالة لجميع المشتركين (Broadcast):**\n\n"
-        "أرسل الآن الرسالة التي تود اذاعتها (نص، صورة، أو فيديو مع وصف). سيتم إرسالها فوراً لكل مستخدمي البوت.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="admin_panel")]])
-    )
+    await query.edit_message_text("📢 أرسل الآن رسالة الإذاعة (نص أو صورة أو فيديو):", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="admin_panel")]]))
 
-# معالجة رسائل الإذاعة للمالك
 async def handle_admin_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    
     if update.effective_user:
         register_user(update.effective_user)
 
     if user_id == SUPER_ADMIN_ID and context.user_data.get('waiting_for_broadcast', False):
         context.user_data['waiting_for_broadcast'] = False
-        
-        success_count = 0
-        fail_count = 0
-        
-        await update.message.reply_text("🚀 جاري إرسال الرسالة لجميع المشتركين، يرجى الانتظار...")
+        success_count, fail_count = 0, 0
+        await update.message.reply_text("🚀 جاري إرسال الإذاعة...")
         
         for target_id in USERS_DB.keys():
             try:
-                await context.bot.copy_message(
-                    chat_id=target_id,
-                    from_chat_id=update.message.chat_id,
-                    message_id=update.message.message_id
-                )
+                await context.bot.copy_message(chat_id=target_id, from_chat_id=update.message.chat_id, message_id=update.message.message_id)
                 success_count += 1
             except Exception:
                 fail_count += 1
                 
-        await update.message.reply_text(
-            f"✅ **تمت الإذاعة بنجاح!**\n\n"
-            f"📤 تم الإرسال إلى: `{success_count}` مستخدماً.\n"
-            f"❌ فشل الإرسال إلى: `{fail_count}`.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ لوحة التحكم", callback_data="admin_panel")]])
-        )
+        await update.message.reply_text(f"✅ تمت الإذاعة بنجاح!\n📤 نجاح: {success_count}\n❌ فشل: {fail_count}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ لوحة التحكم", callback_data="admin_panel")]]))
         return
 
     await handle_url_input(update, context)
 
 if __name__ == '__main__':
-    BOT_TOKEN = "9011485348:AAGo-8Z2VaJNn3xo4Aufip16V87sP_n5E9Y"  # <--- ضع توكن البوت الخاص بك هنا
+    BOT_TOKEN = "9011485348:AAGo-8Z2VaJNn3xo4Aufip16V87sP_n5E9Y"  # التوكن الصحيح الخاص بك
     
-    application = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .read_timeout(60)
-        .write_timeout(60)
-        .connect_timeout(60)
-        .build()
-    )
+    application = ApplicationBuilder().token(BOT_TOKEN).read_timeout(60).write_timeout(60).connect_timeout(60).build()
 
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), handle_admin_messages))
 
-    print("🚀 جاري تشغيل بوت التحميل الشامل بالواجهة الجديدة والميزات المتكاملة...")
+    print("🚀 البوت يعمل الآن مع سيرفر الويب والبورت المخصص للسحابة...")
     application.run_polling()
