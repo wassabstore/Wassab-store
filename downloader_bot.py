@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import tempfile
 import threading
 from datetime import datetime, timezone
@@ -363,6 +364,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id == SUPER_ADMIN_ID:
         text += ("\n\n🔧 <b>أوامر المالك</b>\n"
                  "/stats — الإحصائيات\n"
+                 "/diag [رابط] — فحص yt-dlp واختبار رابط\n"
                  "/ban ID سبب — حظر مستخدم\n"
                  "/unban ID — فك الحظر")
     await update.message.reply_text(text, parse_mode="HTML")
@@ -376,6 +378,44 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != SUPER_ADMIN_ID:
         return
     await update.message.reply_text(stats_text(), parse_mode="HTML")
+
+
+def deno_version():
+    try:
+        out = subprocess.run(["deno", "--version"], capture_output=True, text=True, timeout=5)
+        return out.stdout.splitlines()[0] if out.stdout else "غير موجود"
+    except Exception:
+        return "غير موجود ❌"
+
+
+async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/diag [رابط] — يفحص نسخة yt-dlp وDeno ويختبر رابطاً (للمالك فقط)."""
+    if update.effective_user.id != SUPER_ADMIN_ID:
+        return
+    has_cookies = os.path.exists("cookies.txt")
+    lines = [
+        f"yt-dlp: {yt_dlp.version.__version__}",
+        f"deno: {deno_version()}",
+        f"ffmpeg: {HAS_FFMPEG} | aria2c: {HAS_ARIA2}",
+        f"cookies.txt: {'موجود ✅' if has_cookies else 'غير موجود ❌'}",
+    ]
+    if context.args:
+        url = context.args[0]
+        await update.message.reply_text("\n".join(lines) + "\n\n🔎 جاري اختبار الرابط...")
+
+        def probe():
+            opts = {'quiet': True, 'no_warnings': True, 'no_color': True, 'skip_download': True}
+            if has_cookies:
+                opts['cookiefile'] = "cookies.txt"
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False)
+
+        try:
+            info = await asyncio.to_thread(probe)
+            lines = [f"✅ نجح الاستخراج: {info.get('title')}"]
+        except Exception as e:
+            lines = [f"❌ {str(e)[-600:]}"]
+    await update.message.reply_text("\n".join(lines), disable_web_page_preview=True)
 
 
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -844,6 +884,7 @@ if __name__ == '__main__':
     application.add_handler(CommandHandler('help', help_command))
     application.add_handler(CommandHandler('me', me_command))
     application.add_handler(CommandHandler('stats', stats_command))
+    application.add_handler(CommandHandler('diag', diag_command))
     application.add_handler(CommandHandler('ban', ban_command))
     application.add_handler(CommandHandler('unban', unban_command))
     application.add_handler(CallbackQueryHandler(button_handler))
