@@ -622,6 +622,7 @@ def build_opts(media_type, quality, workdir):
         'noplaylist': True,
         'quiet': True,
         'no_warnings': True,
+        'no_color': True,
         'retries': 5,
         'fragment_retries': 5,
         'socket_timeout': 30,
@@ -664,6 +665,17 @@ def pick_output_file(workdir):
         and not f.endswith(('.part', '.ytdl', '.temp'))
     ]
     return max(files, key=os.path.getsize) if files else None
+
+
+async def notify_admin_error(context, user_id, url, err):
+    """يرسل للمالك سبب فشل التحميل الحقيقي (بدل البحث في لوغ Render)."""
+    try:
+        await context.bot.send_message(
+            SUPER_ADMIN_ID,
+            f"⚠️ فشل تحميل\n👤 المستخدم: {user_id}\n🔗 {url}\n\n{str(err)[-700:]}",
+            disable_web_page_preview=True)
+    except Exception:
+        pass
 
 
 async def process_download(query, context, media_type, quality=None):
@@ -739,6 +751,7 @@ async def process_download(query, context, media_type, quality=None):
 
     except yt_dlp.utils.DownloadError as e:
         logging.error(f"Download error: {e}")
+        await notify_admin_error(context, user_id, url, e)
         await query.edit_message_text("❌ تعذر تحميل هذا الرابط. قد يكون محمياً أو غير مدعوم أو يحتاج تسجيل دخول.")
     except Exception as e:
         logging.exception(f"Error: {e}")
@@ -836,5 +849,6 @@ if __name__ == '__main__':
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), handle_message))
 
-    print(f"🚀 البوت يعمل | ffmpeg={HAS_FFMPEG} | aria2c={HAS_ARIA2} | الحد الأقصى={MAX_UPLOAD_MB}MB")
+    print(f"🚀 البوت يعمل | yt-dlp={yt_dlp.version.__version__} | ffmpeg={HAS_FFMPEG} | "
+          f"aria2c={HAS_ARIA2} | deno={shutil.which('deno') is not None} | الحد الأقصى={MAX_UPLOAD_MB}MB")
     application.run_polling(drop_pending_updates=True)
