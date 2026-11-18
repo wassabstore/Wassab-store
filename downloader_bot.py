@@ -6,12 +6,15 @@ import os
 import shutil
 import subprocess
 import tempfile
+import sys
 import threading
+import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import yt_dlp
+from telegram.error import Conflict
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (ApplicationBuilder, ApplicationHandlerStop,
                           CallbackQueryHandler, CommandHandler, ContextTypes,
@@ -52,6 +55,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
     HTTPServer(('0.0.0.0', port), SimpleHandler).serve_forever()
@@ -62,26 +66,21 @@ def today():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def load_state():
+DIRTY = {"flag": False}   # هل تغيّرت البيانات منذ آخر نسخة احتياطية؟
+FRESH_START = not os.path.exists(STATE_FILE)   # قرص جديد (بعد نوم/إعادة تشغيل Render)
+
+
+def normalize_state(raw):
     state = {
         "users": {},
         "banned": {},
         "settings": {"daily_limit": 20, "maintenance": False},
         "stats": {"downloads": {}, "daily": {}},
     }
-    try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            state["users"] = {int(k): v for k, v in raw.get("users", {}).items()}
-            state["banned"] = {int(k): v for k, v in raw.get("banned", {}).items()}
-            state["settings"].update(raw.get("settings", {}))
-            state["stats"].update(raw.get("stats", {}))
-        elif os.path.exists(OLD_USERS_FILE):
-            with open(OLD_USERS_FILE, "r", encoding="utf-8") as f:
-                state["users"] = {int(k): v for k, v in json.load(f).items()}
-    except Exception as e:
-        logging.error(f"Error loading state: {e}")
+    state["users"] = {int(k): v for k, v in raw.get("users", {}).items()}
+    state["banned"] = {int(k): v for k, v in raw.get("banned", {}).items()}
+    state["settings"].update(raw.get("settings", {}))
+    state["stats"].update(raw.get("stats", {}))
 
     st = state["stats"]
     st.setdefault("downloads", {})
@@ -89,6 +88,19 @@ def load_state():
     for k in ("video", "audio", "voice"):
         st["downloads"].setdefault(k, 0)
     return state
+
+
+def load_state():
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return normalize_state(json.load(f))
+        if os.path.exists(OLD_USERS_FILE):
+            with open(OLD_USERS_FILE, "r", encoding="utf-8") as f:
+                return normalize_state({"users": json.load(f)})
+    except Exception as e:
+        logging.error(f"Error loading state: {e}")
+    return normalize_state({})
 
 
 STATE = load_state()
@@ -100,8 +112,125 @@ def save_state():
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(STATE, f, ensure_ascii=False, indent=2)
         os.replace(tmp, STATE_FILE)   # كتابة آمنة حتى لا يتلف الملف عند انقطاع التشغيل
+        DIRTY["flag"] = True
     except Exception as e:
         logging.error(f"Error saving state: {e}")
+
+
+# ----------------- النسخ الاحتياطي والاستعادة عبر تيليجرام -----------------
+# الفكرة: قرص Render المجاني مؤقت. لذلك يُرسل البوت ملف البيانات للمالك ويثبّته في المحادثة،
+# وعند أي تشغيل جديد بقرص فارغ يقرأ آخر نسخة مثبّتة ويستعيد البيانات تلقائياً.
+BACKUP_INTERVAL_MIN = int(os.environ.get("BACKUP_INTERVAL_MIN", 30))
+KEEPALIVE_URL = os.environ.get("KEEPALIVE_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+
+
+def restore_from_bytes(data):
+    """يستبدل البيانات الحالية بمحتوى ملف نسخة احتياطية. يرجع (عدد المستخدمين، عدد المحظورين)."""
+    raw = json.loads(data.decode("utf-8"))
+    if not isinstance(raw, dict) or not isinstance(raw.get("users"), dict):
+        raise ValueError("الملف ليس نسخة احتياطية صالحة")
+    new_state = normalize_state(raw)
+
+    if os.path.exists(STATE_FILE):
+        shutil.copy(STATE_FILE, STATE_FILE + ".before_restore")
+    STATE.clear()
+    STATE.update(new_state)
+    save_state()
+    DIRTY["flag"] = False   # الملف المستعاد هو نفسه آخر نسخة، فلا حاجة لنسخة جديدة
+    return len(STATE["users"]), len(STATE["banned"])
+
+
+async def send_backup(bot, reason="تلقائية"):
+    """يرسل ملف البيانات للمالك ويثبّته. آخر رسالة مثبّتة هي مصدر الاستعادة التلقائية."""
+    if not os.path.exists(STATE_FILE):
+        save_state()
+    DIRTY["flag"] = False
+    try:
+        name = f"bot_state_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.json"
+        caption = (f"💾 نسخة احتياطية ({reason})\n"
+                   f"👥 {len(STATE['users'])} مستخدم | 🚫 {len(STATE['banned'])} محظور\n"
+                   f"للاستعادة اليدوية: أرسل هذا الملف للبوت.")
+        with open(STATE_FILE, "rb") as f:
+            msg = await bot.send_document(
+                SUPER_ADMIN_ID, document=f, filename=name, caption=caption,
+                disable_notification=True, read_timeout=60, write_timeout=60)
+        try:
+            await bot.unpin_all_chat_messages(SUPER_ADMIN_ID)
+            await bot.pin_chat_message(SUPER_ADMIN_ID, msg.message_id, disable_notification=True)
+        except Exception as e:
+            logging.warning(f"Pin failed: {e}")
+        return True
+    except Exception as e:
+        DIRTY["flag"] = True
+        logging.error(f"Backup failed: {e}")
+        return False
+
+
+async def try_auto_restore(app):
+    """عند تشغيل بقرص فارغ: يقرأ آخر نسخة مثبّتة في محادثة المالك ويستعيدها."""
+    try:
+        chat = await app.bot.get_chat(SUPER_ADMIN_ID)
+        pinned = chat.pinned_message
+        doc = pinned.document if pinned else None
+        if not doc or not (doc.file_name or "").startswith("bot_state"):
+            logging.info("لا توجد نسخة احتياطية مثبّتة للاستعادة.")
+            return
+        tg_file = await app.bot.get_file(doc.file_id)
+        data = bytes(await tg_file.download_as_bytearray())
+        users, banned = restore_from_bytes(data)
+        await app.bot.send_message(
+            SUPER_ADMIN_ID,
+            f"♻️ تمت استعادة البيانات تلقائياً بعد إعادة التشغيل\n👥 المستخدمون: {users}\n🚫 المحظورون: {banned}")
+    except Exception as e:
+        logging.warning(f"Auto restore failed: {e}")
+
+
+async def backup_loop(app):
+    while True:
+        await asyncio.sleep(BACKUP_INTERVAL_MIN * 60)
+        if DIRTY["flag"]:
+            await send_backup(app.bot, "تلقائية")
+
+
+async def keep_alive_loop():
+    """ينبّه رابط الخدمة كل 8 دقائق حتى لا تنام خدمة Render المجانية (تنام بعد 15 دقيقة)."""
+    if not KEEPALIVE_URL:
+        logging.info("KEEPALIVE_URL غير محدد، تم تخطي الـ keep-alive الذاتي.")
+        return
+
+    def ping():
+        with urllib.request.urlopen(KEEPALIVE_URL, timeout=20) as r:
+            return r.status
+
+    while True:
+        await asyncio.sleep(8 * 60)
+        try:
+            await asyncio.to_thread(ping)
+        except Exception as e:
+            logging.warning(f"Keep-alive failed: {e}")
+
+
+async def error_handler(update, context):
+    if isinstance(context.error, Conflict):
+        logging.warning("Conflict: نسخة أخرى تعمل بنفس التوكن (طبيعي لثوانٍ أثناء النشر).")
+        return
+    logging.error("Unhandled exception", exc_info=context.error)
+
+
+async def post_init(app):
+    if FRESH_START and not STATE["users"]:
+        await try_auto_restore(app)
+    app.bot_data["tasks"] = [
+        asyncio.create_task(backup_loop(app)),
+        asyncio.create_task(keep_alive_loop()),
+    ]
+
+
+async def post_stop(app):
+    for t in app.bot_data.get("tasks", []):
+        t.cancel()
+    if DIRTY["flag"]:
+        await send_backup(app.bot, "عند الإيقاف")
 
 
 def register_user(user):
@@ -364,6 +493,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += ("\n\n🔧 <b>أوامر المالك</b>\n"
                  "/stats — الإحصائيات\n"
                  "/diag [رابط] — فحص yt-dlp واختبار رابط\n"
+                 "/backup — إرسال نسخة احتياطية الآن\n"
                  "/ban ID سبب — حظر مستخدم\n"
                  "/unban ID — فك الحظر")
     await update.message.reply_text(text, parse_mode="HTML")
@@ -415,6 +545,14 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             lines = [f"❌ {str(e)[-600:]}"]
     await update.message.reply_text("\n".join(lines), disable_web_page_preview=True)
+
+
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != SUPER_ADMIN_ID:
+        return
+    ok = await send_backup(context.bot, "يدوية")
+    if not ok:
+        await update.message.reply_text("❌ فشل إرسال النسخة الاحتياطية، راجع اللوغ.")
 
 
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -469,6 +607,7 @@ async def handle_url_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ADMIN_CALLBACKS = {
     "admin_panel", "list_all_users", "broadcast_prompt", "stats_view",
     "prompt_ban", "prompt_unban", "banned_list", "toggle_maint", "prompt_limit",
+    "backup_now", "prompt_restore",
 }
 
 
@@ -484,6 +623,8 @@ def admin_keyboard():
          InlineKeyboardButton("✅ فك حظر", callback_data="prompt_unban")],
         [InlineKeyboardButton("📋 قائمة المحظورين", callback_data="banned_list")],
         [InlineKeyboardButton("📢 إرسال إذاعة", callback_data="broadcast_prompt")],
+        [InlineKeyboardButton("💾 نسخة احتياطية الآن", callback_data="backup_now"),
+         InlineKeyboardButton("♻️ استعادة نسخة", callback_data="prompt_restore")],
         [InlineKeyboardButton(f"🛠 وضع الصيانة: {maint_label}", callback_data="toggle_maint")],
         [InlineKeyboardButton(f"🔢 الحد اليومي: {limit_label}", callback_data="prompt_limit")],
         [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="back_home")],
@@ -589,6 +730,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE["settings"]["maintenance"] = not STATE["settings"]["maintenance"]
         save_state()
         await query.edit_message_text(panel_text(), reply_markup=admin_keyboard(), parse_mode="HTML")
+
+    elif data == "backup_now":
+        ok = await send_backup(context.bot, "يدوية")
+        note = "✅ تم إرسال النسخة الاحتياطية وتثبيتها." if ok else "❌ فشل إرسال النسخة، راجع اللوغ."
+        await query.edit_message_text(panel_text() + "\n\n" + note,
+                                      reply_markup=admin_keyboard(), parse_mode="HTML")
+
+    elif data == "prompt_restore":
+        await query.edit_message_text(
+            "♻️ أرسل الآن ملف النسخة الاحتياطية (<code>bot_state_....json</code>).\n"
+            "⚠️ ستُستبدل البيانات الحالية بمحتوى الملف.",
+            reply_markup=CANCEL_TO_PANEL, parse_mode="HTML")
 
     elif data == "prompt_limit":
         context.user_data['admin_action'] = 'set_limit'
@@ -812,6 +965,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action = context.user_data.pop('admin_action', None)
         panel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ لوحة التحكم", callback_data="admin_panel")]])
 
+        # استعادة يدوية: المالك يرسل ملف النسخة الاحتياطية (.json) للبوت
+        doc = update.message.document
+        if doc and (doc.file_name or "").lower().endswith(".json"):
+            try:
+                tg_file = await context.bot.get_file(doc.file_id)
+                data = bytes(await tg_file.download_as_bytearray())
+                users, banned = restore_from_bytes(data)
+                await update.message.reply_text(
+                    f"♻️ تمت الاستعادة بنجاح\n👥 المستخدمون: {users}\n🚫 المحظورون: {banned}",
+                    reply_markup=panel_btn)
+            except Exception as e:
+                await update.message.reply_text(f"❌ فشلت الاستعادة: {e}")
+            return
+
         if action == 'broadcast':
             ok, fail = 0, 0
             await update.message.reply_text("🚀 جاري إرسال الإذاعة...")
@@ -866,6 +1033,8 @@ if __name__ == '__main__':
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .concurrent_updates(True)
+        .post_init(post_init)
+        .post_stop(post_stop)
         .read_timeout(60).write_timeout(60).connect_timeout(60).pool_timeout(60)
     )
     if LOCAL_API:
@@ -875,6 +1044,7 @@ if __name__ == '__main__':
                    .local_mode(True))
 
     application = builder.build()
+    application.add_error_handler(error_handler)
 
     # الحارس أولاً (group=-1): تسجيل + حظر + صيانة
     application.add_handler(TypeHandler(Update, gatekeeper), group=-1)
@@ -884,6 +1054,7 @@ if __name__ == '__main__':
     application.add_handler(CommandHandler('me', me_command))
     application.add_handler(CommandHandler('stats', stats_command))
     application.add_handler(CommandHandler('diag', diag_command))
+    application.add_handler(CommandHandler('backup', backup_command))
     application.add_handler(CommandHandler('ban', ban_command))
     application.add_handler(CommandHandler('unban', unban_command))
     application.add_handler(CallbackQueryHandler(button_handler))
@@ -891,4 +1062,9 @@ if __name__ == '__main__':
 
     print(f"🚀 البوت يعمل | yt-dlp={yt_dlp.version.__version__} | ffmpeg={HAS_FFMPEG} | "
           f"aria2c={HAS_ARIA2} | deno={shutil.which('deno') is not None} | الحد الأقصى={MAX_UPLOAD_MB}MB")
-    application.run_polling(drop_pending_updates=True)
+    try:
+        application.run_polling(drop_pending_updates=True)
+    except Exception:
+        logging.exception("توقف البوت بسبب خطأ")
+    # إذا وصلنا هنا فقد توقف البوت: ننهي العملية بخطأ ليعيد Render تشغيلها تلقائياً
+    sys.exit(1)
