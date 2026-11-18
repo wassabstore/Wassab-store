@@ -60,7 +60,23 @@ def prepare_cookies():
     return None
 
 
-COOKIE_FILE = prepare_cookies()
+COOKIE_FILE = None
+
+
+def refresh_cookie_file():
+    """الأولوية للكوكيز التي رفعها المالك عبر تيليجرام (محفوظة في STATE)، ثم ملف Secret/البيئة."""
+    global COOKIE_FILE
+    text = STATE.get("cookies", "")
+    if text:
+        dest = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+        try:
+            with open(dest, "w", encoding="utf-8") as f:
+                f.write(text if text.endswith("\n") else text + "\n")
+            COOKIE_FILE = dest
+            return
+        except Exception as e:
+            logging.warning(f"تعذر كتابة ملف الكوكيز: {e}")
+    COOKIE_FILE = prepare_cookies()
 
 
 # ----------------- خادم وهمي لإبقاء البورت مفتوحاً -----------------
@@ -94,7 +110,9 @@ def normalize_state(raw):
         "banned": {},
         "settings": {"daily_limit": 20, "maintenance": False},
         "stats": {"downloads": {}, "daily": {}},
+        "cookies": "",
     }
+    state["cookies"] = raw.get("cookies", "") or ""
     state["users"] = {int(k): v for k, v in raw.get("users", {}).items()}
     state["banned"] = {int(k): v for k, v in raw.get("banned", {}).items()}
     state["settings"].update(raw.get("settings", {}))
@@ -122,6 +140,7 @@ def load_state():
 
 
 STATE = load_state()
+refresh_cookie_file()
 
 
 def save_state():
@@ -155,6 +174,7 @@ def restore_from_bytes(data):
     STATE.update(new_state)
     save_state()
     DIRTY["flag"] = False   # الملف المستعاد هو نفسه آخر نسخة، فلا حاجة لنسخة جديدة
+    refresh_cookie_file()
     return len(STATE["users"]), len(STATE["banned"])
 
 
@@ -512,6 +532,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  "/stats — الإحصائيات\n"
                  "/diag [رابط] — فحص yt-dlp واختبار رابط\n"
                  "/backup — إرسال نسخة احتياطية الآن\n"
+                 "/clearcookies — حذف كوكيز يوتيوب المحفوظة\n"
+                 "📎 لتفعيل الكوكيز: أرسل ملف cookies.txt للبوت\n"
                  "/ban ID سبب — حظر مستخدم\n"
                  "/unban ID — فك الحظر")
     await update.message.reply_text(text, parse_mode="HTML")
@@ -563,6 +585,15 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             lines = [f"❌ {str(e)[-600:]}"]
     await update.message.reply_text("\n".join(lines), disable_web_page_preview=True)
+
+
+async def clearcookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != SUPER_ADMIN_ID:
+        return
+    STATE["cookies"] = ""
+    save_state()
+    refresh_cookie_file()
+    await update.message.reply_text("🗑 تم حذف الكوكيز المحفوظة من البوت.")
 
 
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -983,8 +1014,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action = context.user_data.pop('admin_action', None)
         panel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ لوحة التحكم", callback_data="admin_panel")]])
 
-        # استعادة يدوية: المالك يرسل ملف النسخة الاحتياطية (.json) للبوت
         doc = update.message.document
+
+        # رفع كوكيز يوتيوب: المالك يرسل ملف cookies.txt (صيغة Netscape) للبوت
+        if doc and (doc.file_name or "").lower().endswith(".txt"):
+            try:
+                tg_file = await context.bot.get_file(doc.file_id)
+                text = bytes(await tg_file.download_as_bytearray()).decode("utf-8", errors="ignore")
+                low = text.lower()
+                if "\t" not in text or ("youtube" not in low and "google" not in low):
+                    raise ValueError("لا يبدو ملف كوكيز يوتيوب بصيغة Netscape")
+                STATE["cookies"] = text
+                save_state()
+                refresh_cookie_file()
+                try:
+                    await update.message.delete()   # حذف الرسالة لأن الملف حساس
+                except Exception:
+                    pass
+                await context.bot.send_message(
+                    update.effective_chat.id,
+                    "✅ تم حفظ الكوكيز وتفعيلها (وحُذف الملف من المحادثة).\n"
+                    "جرّب الآن: /diag ثم رابط يوتيوب.")
+            except Exception as e:
+                await update.message.reply_text(f"❌ تعذر حفظ الكوكيز: {e}")
+            return
+
+        # استعادة يدوية: المالك يرسل ملف النسخة الاحتياطية (.json) للبوت
         if doc and (doc.file_name or "").lower().endswith(".json"):
             try:
                 tg_file = await context.bot.get_file(doc.file_id)
@@ -1073,6 +1128,7 @@ if __name__ == '__main__':
     application.add_handler(CommandHandler('stats', stats_command))
     application.add_handler(CommandHandler('diag', diag_command))
     application.add_handler(CommandHandler('backup', backup_command))
+    application.add_handler(CommandHandler('clearcookies', clearcookies_command))
     application.add_handler(CommandHandler('ban', ban_command))
     application.add_handler(CommandHandler('unban', unban_command))
     application.add_handler(CallbackQueryHandler(button_handler))
