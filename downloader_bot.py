@@ -62,6 +62,13 @@ def prepare_cookies():
 
 COOKIE_FILE = None
 
+# بروكسي سكني اختياري، مثال: http://user:pass@host:port  (يُستخدم لروابط يوتيوب فقط لتوفير الباقة)
+PROXY_URL = os.environ.get("PROXY_URL")
+
+
+def is_youtube(url):
+    return any(d in url for d in ("youtube.com", "youtu.be"))
+
 
 def refresh_cookie_file():
     """الأولوية للكوكيز التي رفعها المالك عبر تيليجرام (محفوظة في STATE)، ثم ملف Secret/البيئة."""
@@ -567,6 +574,7 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"deno: {deno_version()}",
         f"ffmpeg: {HAS_FFMPEG} | aria2c: {HAS_ARIA2}",
         f"cookies.txt: {'موجود ✅' if has_cookies else 'غير موجود ❌'}",
+        f"proxy: {'مفعّل ✅' if PROXY_URL else 'غير مفعّل'}",
     ]
     if context.args:
         url = context.args[0]
@@ -574,6 +582,8 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         def probe():
             opts = {'quiet': True, 'no_warnings': True, 'no_color': True, 'skip_download': True}
+            if PROXY_URL and is_youtube(url):
+                opts['proxy'] = PROXY_URL
             if has_cookies:
                 opts['cookiefile'] = COOKIE_FILE
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -857,7 +867,7 @@ def video_format(height, limit_mb, merge):
     return "/".join(parts)
 
 
-def build_opts(media_type, quality, workdir):
+def build_opts(media_type, quality, workdir, url=None):
     opts = {
         'outtmpl': os.path.join(workdir, '%(id)s.%(ext)s'),
         'noplaylist': True,
@@ -877,6 +887,8 @@ def build_opts(media_type, quality, workdir):
 
     if COOKIE_FILE:
         opts['cookiefile'] = COOKIE_FILE
+    if PROXY_URL and url and is_youtube(url):
+        opts['proxy'] = PROXY_URL
 
     if media_type in ("audio", "voice"):
         opts['format'] = 'bestaudio[ext=m4a]/bestaudio/best'
@@ -945,7 +957,7 @@ async def process_download(query, context, media_type, quality=None):
         await query.edit_message_text("♻️┇جاري التحميل...")
 
         async with get_slots():
-            info = await asyncio.to_thread(run_ytdlp, url, build_opts(media_type, quality, workdir))
+            info = await asyncio.to_thread(run_ytdlp, url, build_opts(media_type, quality, workdir, url))
 
         file_path = pick_output_file(workdir)
         if not info or not file_path:
