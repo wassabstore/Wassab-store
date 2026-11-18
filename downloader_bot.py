@@ -9,6 +9,7 @@ import logging
 import tempfile
 import threading
 import contextlib
+import urllib.request
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
@@ -31,12 +32,18 @@ from telegram.ext import (
 )
 
 # ==================== الإعدادات ====================
-# متغيرات البيئة: BOT_TOKEN (إجباري) - OWNER_ID - DB_PATH - RENDER_EXTERNAL_URL
+# متغيرات البيئة: BOT_TOKEN (إجباري) - OWNER_ID - OWNER_USERNAME - DB_PATH
+#                 RENDER_EXTERNAL_URL - BACKUP_CHAT - BACKUP_EVERY_MIN
 TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ.get("OWNER_ID", "8233150959"))
+OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "").lstrip("@")
 DB_PATH = os.environ.get("DB_PATH", "guard_bot.db")
 BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://botstore-54tw.onrender.com").rstrip("/")
 WEBHOOK_URL = f"{BASE_URL}/{TOKEN}"
+
+BACKUP_CHAT = int(os.environ.get("BACKUP_CHAT", OWNER_ID))
+BACKUP_EVERY_MIN = int(os.environ.get("BACKUP_EVERY_MIN", "30"))
+BACKUP_NAME = "guard_backup.db"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -55,7 +62,7 @@ DEFAULTS = {
     "service": 0,        # حذف رسائل الدخول والخروج
     "flood": 0,          # منع التكرار
     "captcha": 0,        # التحقق من الأعضاء الجدد
-    "welcome": 0,        # رسالة الترحيب
+    "welcome": 1,        # رسالة الترحيب
     "warnlimit": 3,
     "punish": "mute",    # mute / kick / ban
     "mutemin": 60,
@@ -90,6 +97,34 @@ def norm(t: str) -> str:
     t = _AR_CLEAN.sub("", (t or "").lower())
     return (t.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
              .replace("ى", "ي").replace("ة", "ه"))
+
+# ==================== الاسترجاع التلقائي للنسخة الاحتياطية ====================
+
+
+def restore_backup_if_needed():
+    """إن لم توجد قاعدة بيانات (بعد إعادة تشغيل Render) يستعيدها من الرسالة المثبتة."""
+    if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
+        return
+    try:
+        api = f"https://api.telegram.org/bot{TOKEN}"
+        chat = json.load(urllib.request.urlopen(f"{api}/getChat?chat_id={BACKUP_CHAT}", timeout=20))["result"]
+        doc = (chat.get("pinned_message") or {}).get("document")
+        if not doc or doc.get("file_name") != BACKUP_NAME:
+            logger.info("لا توجد نسخة احتياطية للاسترجاع")
+            return
+        fp = json.load(urllib.request.urlopen(f"{api}/getFile?file_id={doc['file_id']}", timeout=20))["result"]["file_path"]
+        data = urllib.request.urlopen(f"https://api.telegram.org/file/bot{TOKEN}/{fp}", timeout=60).read()
+        if data[:15] == b"SQLite format 3":
+            with open(DB_PATH, "wb") as f:
+                f.write(data)
+            logger.info("تم استرجاع النسخة الاحتياطية (%d بايت)", len(data))
+        else:
+            logger.warning("الملف المثبت ليس قاعدة SQLite صالحة")
+    except Exception:
+        logger.exception("فشل الاسترجاع")
+
+
+restore_backup_if_needed()
 
 # ==================== قاعدة البيانات ====================
 
@@ -515,12 +550,70 @@ async def on_service_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except TelegramError:
             pass
 
+# ==================== حظر/تقييد بالرد على الرسالة ====================
+
+async def on_reply_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not m or not chat:
+        return
+    t = m.reply_to_message.from_user if m.reply_to_message else None
+    if not t or not user:
+        return
+    anon_admin = bool(m.sender_chat and m.sender_chat.id == chat.id)
+    if not anon_admin and not await is_admin(context, chat.id, user.id):
+        return
+    if t.id == context.bot.id or await is_admin(context, chat.id, t.id, force=True):
+        await m.reply_text("❌ لا يمكن تنفيذ الأمر على مشرف.")
+        return
+    text = norm(m.text or "")
+    num = re.search(r"\d+", text)
+    name = t.full_name
+    try:
+        if text.startswith(("الغاء", "فك")):
+            await lift_restrictions(context, chat.id, t.id)
+            await context.bot.send_message(chat.id, f"✅ تم رفع القيود عن {mention(t.id, name)}.", parse_mode="HTML")
+        elif text.startswith("حظر"):
+            await do_punish(context, chat.id, t.id, name, "ban")
+            await context.bot.send_message(chat.id, punish_text(t.id, name, "ban", 0, "قرار المشرف"),
+                                           reply_markup=lift_markup(chat.id, t.id), parse_mode="HTML")
+        else:
+            mins = int(num.group()) if num else int(get_settings(chat.id)["mutemin"])
+            await do_punish(context, chat.id, t.id, name, "mute", mins)
+            await context.bot.send_message(chat.id, punish_text(t.id, name, "mute", mins, "قرار المشرف"),
+                                           reply_markup=lift_markup(chat.id, t.id), parse_mode="HTML")
+    except TelegramError as e:
+        await m.reply_text(f"❌ {e}")
+        return
+    try:
+        await m.delete()
+    except TelegramError:
+        pass
+
 # ==================== الأعضاء الجدد والتحقق ====================
+
+async def group_link(context, chat):
+    if chat.username:
+        return f"https://t.me/{chat.username}", f"@{chat.username}"
+    try:
+        link = (await context.bot.get_chat(chat.id)).invite_link
+        if link:
+            return link, "🔗 رابط المجموعة"
+    except TelegramError:
+        pass
+    return None, None
+
 
 async def send_welcome(context, chat, user, s):
     tpl = html.escape(s["welcometext"])
     text = tpl.replace("{name}", mention(user.id, user.full_name)).replace("{title}", html.escape(chat.title or ""))
-    await say(context, chat.id, text, ttl=90)
+    if OWNER_USERNAME:
+        row = [Btn(f"@{OWNER_USERNAME}", url=f"https://t.me/{OWNER_USERNAME}")]
+    else:
+        row = [Btn("👑 المالك", url=f"tg://user?id={OWNER_ID}")]
+    url, label = await group_link(context, chat)
+    if url:
+        row.append(Btn(label, url=url))
+    await say(context, chat.id, text, Markup([row]), ttl=90)
 
 
 async def captcha_timeout(bot, chat_id, uid, mid):
@@ -586,6 +679,41 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_welcome(context, chat, u, s)
 
 
+# ---------- مغادرة المجموعات التي لست مشرفاً فيها ----------
+
+async def leave_if_not_admin(bot, chat_id, delay=0):
+    if delay:
+        await asyncio.sleep(delay)
+    try:
+        me = await bot.get_chat_member(chat_id, bot.id)
+    except Forbidden:
+        db_exec("UPDATE chats SET active = 0 WHERE chat_id = ?", (chat_id,))
+        _known_chats.discard(chat_id)
+        return
+    except TelegramError:
+        return
+    if me.status in ("administrator", "creator", "owner"):
+        return
+    with contextlib.suppress(TelegramError):
+        await bot.send_message(chat_id, "🚪 سأغادر لأنني لست مشرفاً. أعد إضافتي كمشرف.")
+    with contextlib.suppress(TelegramError):
+        await bot.leave_chat(chat_id)
+    db_exec("UPDATE chats SET active = 0 WHERE chat_id = ?", (chat_id,))
+    _known_chats.discard(chat_id)
+
+
+async def admin_sweep_loop(bot):
+    await asyncio.sleep(90)
+    while True:
+        try:
+            for r in db_all("SELECT chat_id FROM chats WHERE active = 1"):
+                await leave_if_not_admin(bot, r["chat_id"])
+                await asyncio.sleep(0.5)
+        except Exception:
+            logger.exception("خطأ في فحص المشرفين")
+        await asyncio.sleep(3600)
+
+
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cm = update.my_chat_member
     if not cm:
@@ -599,7 +727,10 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if new in ("member", "administrator"):
         register_chat(chat, 1)
         if new == "member":
-            await say(context, chat.id, "🛡️ شكراً لإضافتي! اجعلني <b>مشرفاً</b> مع صلاحيتي حذف الرسائل وحظر المستخدمين ليعمل الحماية.\nاكتب /settings لفتح الإعدادات.", ttl=90)
+            await say(context, chat.id, "🛡️ اجعلني <b>مشرفاً</b> خلال دقيقتين وإلا سأغادر المجموعة.", ttl=120)
+            spawn(leave_if_not_admin(context.bot, chat.id, 120))
+        else:
+            _admin_cache.clear()
         try:
             await context.bot.send_message(
                 cm.from_user.id, f"✅ تمت إضافتي إلى <b>{html.escape(chat.title or '')}</b>.\nاضغط لفتح الإعدادات:",
@@ -879,6 +1010,49 @@ async def run_broadcast(context, src, target, owner_chat):
                 pass
     await say(context, owner_chat, f"✅ انتهت الإذاعة.\nنجح: <b>{ok}</b> | فشل: <b>{fail}</b>")
 
+# ==================== النسخ الاحتياطي التلقائي ====================
+
+async def do_backup(bot):
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    try:
+        src = sqlite3.connect(DB_PATH)
+        dst = sqlite3.connect(tmp.name)
+        src.backup(dst)
+        dst.close()
+        src.close()
+        old_id = None
+        try:
+            chat = await bot.get_chat(BACKUP_CHAT)
+            pm = chat.pinned_message
+            if pm and pm.document and pm.document.file_name == BACKUP_NAME:
+                old_id = pm.message_id
+        except TelegramError:
+            pass
+        with open(tmp.name, "rb") as f:
+            msg = await bot.send_document(BACKUP_CHAT, f, filename=BACKUP_NAME,
+                                          caption=f"💾 نسخة تلقائية {now_str()}", disable_notification=True)
+        await bot.pin_chat_message(BACKUP_CHAT, msg.message_id, disable_notification=True)
+        if old_id:
+            try:
+                await bot.delete_message(BACKUP_CHAT, old_id)
+            except TelegramError:
+                pass
+        return True
+    except Exception:
+        logger.exception("فشل النسخ الاحتياطي")
+        return False
+    finally:
+        with contextlib.suppress(Exception):
+            os.unlink(tmp.name)
+
+
+async def backup_loop(bot):
+    await asyncio.sleep(60)
+    while True:
+        await do_backup(bot)
+        await asyncio.sleep(max(1, BACKUP_EVERY_MIN) * 60)
+
 # ==================== واجهات الإدارة (خاص) ====================
 
 def home_view(context, user):
@@ -908,6 +1082,8 @@ HELP_TEXT = (
     "<b>أوامر المشرفين داخل المجموعة</b> (بالرد على العضو):\n"
     "/ban · /unban · /mute [دقائق] · /unmute · /kick\n"
     "/warn · /unwarn · /warns · /trust · /untrust · /settings\n\n"
+    "<b>بالكلمات (بالرد على رسالة العضو):</b>\n"
+    "<code>حظر</code> · <code>تقييد</code> · <code>تقييد 30</code> · <code>الغاء الحظر</code> · <code>فك التقييد</code>\n\n"
     "المخالف يُحذف له الرسالة ويُحذَّر، وعند بلوغ الحد يُكتم أو يُطرد أو يُحظر تلقائياً، وتظهر زر <b>رفع القيد</b> للمشرفين."
 )
 
@@ -1246,7 +1422,6 @@ async def owner_callbacks(update, context, parts):
             pass
         db_exec("UPDATE chats SET active = 0 WHERE chat_id = ?", (cid,))
         _known_chats.discard(cid)
-        q.data = "o_groups_0"
         return await owner_callbacks(update, context, ["o", "groups", "0"])
 
     if sub == "gban":
@@ -1266,19 +1441,8 @@ async def owner_callbacks(update, context, parts):
                                Markup([[Btn("🔙 رجوع", callback_data="o_gban")]]))
 
     if sub == "backup":
-        try:
-            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-            tmp.close()
-            src = sqlite3.connect(DB_PATH)
-            dst = sqlite3.connect(tmp.name)
-            src.backup(dst)
-            dst.close()
-            src.close()
-            with open(tmp.name, "rb") as f:
-                await context.bot.send_document(user.id, f, filename="guard_backup.db", caption="💾 نسخة احتياطية")
-            os.unlink(tmp.name)
-        except Exception as e:
-            await say(context, user.id, f"❌ {html.escape(str(e))}")
+        ok = await do_backup(context.bot)
+        await say(context, user.id, "✅ تم أخذ نسخة احتياطية وتثبيتها." if ok else "❌ فشل النسخ الاحتياطي.")
 
 # ==================== رسائل الخاص (الحالات) ====================
 
@@ -1357,6 +1521,10 @@ application.add_handler(CallbackQueryHandler(callback_router))
 application.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS & filters.ChatType.GROUPS, on_new_members))
 application.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_private_message))
+application.add_handler(MessageHandler(
+    filters.ChatType.GROUPS & filters.REPLY &
+    filters.Regex(r"^\s*(حظر|تقييد|تقيد|الغاء الحظر|فك الحظر|فك التقييد)(\s+\d+)?\s*$"),
+    on_reply_action))
 application.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.ALL, on_service_message), group=1)
 application.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, moderate), group=1)
 application.add_error_handler(error_handler)
@@ -1381,6 +1549,9 @@ def ensure_started():
         async def _setup():
             await application.initialize()
             await application.bot.set_webhook(WEBHOOK_URL, allowed_updates=ALLOWED_UPDATES)
+            loop = asyncio.get_running_loop()
+            loop.create_task(backup_loop(application.bot))
+            loop.create_task(admin_sweep_loop(application.bot))
             logger.info("تم ضبط الويب هوك: %s", BASE_URL)
 
         asyncio.run_coroutine_threadsafe(_setup(), new_loop).result(timeout=60)
