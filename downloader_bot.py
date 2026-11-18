@@ -1365,12 +1365,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-async def owner_callbacks(update, context, parts):
+async def owner_callbacks(update, context, parts, answered=False):
     q = update.callback_query
     user = q.from_user
     sub = parts[1]
     back = Markup([[Btn("🔙 رجوع", callback_data="home")]])
-    await q.answer()
+    if not answered:
+        await q.answer()
 
     if sub == "stats":
         users_total = db_one("SELECT COUNT(*) c FROM users")["c"]
@@ -1422,7 +1423,7 @@ async def owner_callbacks(update, context, parts):
             pass
         db_exec("UPDATE chats SET active = 0 WHERE chat_id = ?", (cid,))
         _known_chats.discard(cid)
-        return await owner_callbacks(update, context, ["o", "groups", "0"])
+        return await owner_callbacks(update, context, ["o", "groups", "0"], answered=True)
 
     if sub == "gban":
         rs = db_all("SELECT user_id, reason FROM gbans ORDER BY created_at DESC LIMIT 20")
@@ -1433,7 +1434,7 @@ async def owner_callbacks(update, context, parts):
 
     if sub == "gbdel":
         await ungban_user(context, int(parts[2]))
-        return await owner_callbacks(update, context, ["o", "gban"])
+        return await owner_callbacks(update, context, ["o", "gban"], answered=True)
 
     if sub == "gbadd":
         set_state(user.id, {"action": "gban_add"})
