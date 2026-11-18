@@ -45,6 +45,24 @@ logging.getLogger("httpx").setLevel(logging.WARNING)   # حتى لا يظهر ا
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+def prepare_cookies():
+    """يبحث عن ملف كوكيز يوتيوب وينسخه لمسار قابل للكتابة (لأن yt-dlp يحدّثه أثناء الاستخدام).
+    الأماكن بالترتيب: متغير COOKIES_FILE ثم Secret File في Render ثم cookies.txt بجانب البوت."""
+    for path in (os.environ.get("COOKIES_FILE"), "/etc/secrets/cookies.txt", "cookies.txt"):
+        if path and os.path.isfile(path):
+            dest = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+            try:
+                shutil.copy(path, dest)
+                logging.info(f"تم تحميل ملف الكوكيز من {path}")
+                return dest
+            except Exception as e:
+                logging.warning(f"تعذر نسخ ملف الكوكيز: {e}")
+    return None
+
+
+COOKIE_FILE = prepare_cookies()
+
+
 # ----------------- خادم وهمي لإبقاء البورت مفتوحاً -----------------
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -521,7 +539,7 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/diag [رابط] — يفحص نسخة yt-dlp وDeno ويختبر رابطاً (للمالك فقط)."""
     if update.effective_user.id != SUPER_ADMIN_ID:
         return
-    has_cookies = os.path.exists("cookies.txt")
+    has_cookies = bool(COOKIE_FILE)
     lines = [
         f"yt-dlp: {yt_dlp.version.__version__}",
         f"deno: {deno_version()}",
@@ -535,7 +553,7 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         def probe():
             opts = {'quiet': True, 'no_warnings': True, 'no_color': True, 'skip_download': True}
             if has_cookies:
-                opts['cookiefile'] = "cookies.txt"
+                opts['cookiefile'] = COOKIE_FILE
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
 
@@ -826,8 +844,8 @@ def build_opts(media_type, quality, workdir):
         opts['concurrent_fragment_downloads'] = 8
         opts['http_chunk_size'] = 10 * 1024 * 1024
 
-    if os.path.exists("cookies.txt"):
-        opts['cookiefile'] = "cookies.txt"
+    if COOKIE_FILE:
+        opts['cookiefile'] = COOKIE_FILE
 
     if media_type in ("audio", "voice"):
         opts['format'] = 'bestaudio[ext=m4a]/bestaudio/best'
@@ -1061,7 +1079,7 @@ if __name__ == '__main__':
     application.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), handle_message))
 
     print(f"🚀 البوت يعمل | yt-dlp={yt_dlp.version.__version__} | ffmpeg={HAS_FFMPEG} | "
-          f"aria2c={HAS_ARIA2} | deno={shutil.which('deno') is not None} | الحد الأقصى={MAX_UPLOAD_MB}MB")
+          f"aria2c={HAS_ARIA2} | cookies={bool(COOKIE_FILE)} | deno={shutil.which('deno') is not None} | الحد الأقصى={MAX_UPLOAD_MB}MB")
     try:
         application.run_polling(drop_pending_updates=True)
     except Exception:
