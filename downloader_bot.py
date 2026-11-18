@@ -52,7 +52,6 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
     HTTPServer(('0.0.0.0', port), SimpleHandler).serve_forever()
